@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  janitor（③ crash-leak 対策）用の常駐設定。
+  StartInterval ごとに `agent-caffeine janitor` を実行する短命ジョブ。
+  janitor は「claude も codex も 1 つも生きていない」ときに限り、ターン中に
+  acquire したまま異常終了して残った holder（session_id 等の非数値トークンは
+  reap で消えない）を全消去し caffeinate を停止する安全網。
+
+  ※ B 案（Claude フック駆動）と併用する前提。どちらかのエージェントが生きている
+    限り janitor は何もしないので、正常な holder を巻き込むことはない。
+  ※ ② Codex(C 案) の常時ポーリング acquire を足すなら、別ラベルの watch ジョブを
+    KeepAlive で立てるか、ここを watch ループに差し替える（00_Docs/05_design.md 参照）。
+
+  使い方:
+    cp launchd/com.yudai.agent-caffeine.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.yudai.agent-caffeine.plist
+    # 解除: launchctl unload ~/Library/LaunchAgents/com.yudai.agent-caffeine.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.yudai.agent-caffeine</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/yudai/local_development/02_Personal_Projects/agent-caffeine/src/agent-caffeine</string>
+    <string>janitor</string>
+  </array>
+
+  <!-- 起動直後に 1 回 + 60 秒ごとに実行。短命ジョブなので KeepAlive は付けない
+       （付けると終了即再起動でポーリング間隔が効かなくなる）。 -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <!-- STATE_DIR は $HOME 基準で解決されるため HOME を明示しておく。 -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/yudai</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/agent-caffeine.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/agent-caffeine.err.log</string>
+</dict>
+</plist>

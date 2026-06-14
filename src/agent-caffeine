@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# agent-caffeine — エージェント稼働中だけ Mac を起こす
+#
+# 設計の肝: 参照カウント方式
+#   Claude / Codex を worktree で並行稼働させるため、単純な ON/OFF フラグだと
+#   片方のセッション終了で caffeinate を止めてしまい、もう片方が稼働中なのに
+#   スリープしてしまう。そこで「holder（保持者）」をトークン単位で登録し、
+#   holder が 1 つでも生きている間だけ caffeinate を動かす。
+#
+# 使い方:
+#   agent-caffeine acquire [token]   # holder を登録し caffeinate を起動（冪等）
+#   agent-caffeine release [token]   # holder を解除し、0 になれば caffeinate 停止
+#   agent-caffeine status            # 状態と holder 一覧を表示
+#   agent-caffeine reap              # 死んだ holder（PID 消滅）を掃除
+#   agent-caffeine janitor           # claude/codex が皆無なら残存 holder を全消去（crash-leak 対策）
+#
+# token を省略すると呼び出し元の PPID を使う。Claude フックからは session_id、
+# Codex からはセッション識別子など「生きている間ユニーク」な値を渡すのが堅い。
+# token が数値（PID）の場合のみ、reap でプロセス生存を検証して自動掃除する。
+#
+# 環境変数:
+#   AGENT_CAFFEINE_STATE           状態ディレクトリ（default: ~/.local/state/agent-caffeine）
+#   AGENT_CAFFEINE_FLAGS           caffeinate のフラグ（default: -i -s）
+#   AGENT_CAFFEINE_CLAUDE_PATTERN  janitor の Claude 検出パターン（pgrep -f）
+#   AGENT_CAFFEINE_CODEX_PATTERN   janitor の Codex 検出パターン（pgrep -f / 既定は空=無効）
+#   AGENT_CAFFEINE_JANITOR_GRACE   janitor が holder を消さずに猶予する秒数（default: 60）
+#   AGENT_CAFFEINE_CODEX_WATCH_PATTERN   Codex watch 用の検出パターン（default: openai.chatgpt.*codex）
+#   AGENT_CAFFEINE_CODEX_WATCH_TOKEN     Codex watch が使う holder token（default: codex）
+#   AGENT_CAFFEINE_CODEX_WATCH_INTERVAL  Codex watch のポーリング秒数（default: 15）
+#   AGENT_CAFFEINE_CODEX_LOG_DB          Codex の logs sqlite path（default: ~/.codex/logs_2.sqlite）
+#   AGENT_CAFFEINE_CODEX_LOG_INTERVAL    Codex log watch のポーリング秒数（default: 2）
+#   AGENT_CAFFEINE_PGREP_BIN             テスト用。既定は pgrep
+
+set -euo pipefail
+
+STATE_DIR="${AGENT_CAFFEINE_STATE:-$HOME/.local/state/agent-caffeine}"
+HOLDERS_DIR="$STATE_DIR/holders"
+PID_FILE="$STATE_DIR/caffeinate.pid"
+# 既定は idle sleep 防止(-i) + AC時のsystem sleep防止(-s)。
+# -s は battery 上では macOS 側で無効化されるため、AC 時だけ効く。
+CAFFEINATE_FLAGS="${AGENT_CAFFEINE_FLAGS:--i -s}"
+PGREP_BIN="${AGENT_CAFFEINE_PGREP_BIN:-pgrep}"
+# janitor 用のプロセス検出パターン（2026-06-14 実機確認・VSCode 拡張）。
+CLAUDE_PATTERN="${AGENT_CAFFEINE_CLAUDE_PATTERN:-native-binary/claude}"
+# Codex の PGREP 検出は既定で無効（空）。理由: codex の app-server は VSCode を開いている間
+# ずっと常駐し「稼働中」と誤検出される。有効にすると agents_alive がほぼ永久に true となり、
+# janitor が Claude のリークを一切掃除できなくなる（存在意義が消える）。Codex の活性判定は
+# 既定で logs DB を使い、CODEX_PATTERN は互換用にだけ残す。
+CODEX_PATTERN="${AGENT_CAFFEINE_CODEX_PATTERN:-}"
+# Codex の旧 pgrep watch ループ用。logs DB 監視へ移行済みだが、互換のため残す。
+CODEX_WATCH_PATTERN="${AGENT_CAFFEINE_CODEX_WATCH_PATTERN-openai.chatgpt.*codex}"
+CODEX_WATCH_TOKEN="${AGENT_CAFFEINE_CODEX_WATCH_TOKEN:-codex}"
+CODEX_WATCH_INTERVAL="${AGENT_CAFFEINE_CODEX_WATCH_INTERVAL:-15}"
+CODEX_LOG_DB="${AGENT_CAFFEINE_CODEX_LOG_DB:-$HOME/.codex/logs_2.sqlite}"
+CODEX_LOG_INTERVAL="${AGENT_CAFFEINE_CODEX_LOG_INTERVAL:-2}"
+CODEX_LOG_CURSOR_FILE="$STATE_DIR/codex-log-cursor"
+SQLITE3_BIN="${AGENT_CAFFEINE_SQLITE3_BIN:-sqlite3}"
+# janitor の安全弁: 作られてから GRACE 秒未満の holder は消さない。
+# 検出パターンの誤判定や acquire 直後の取りこぼしで「全滅」と誤認しても、
+# 起動直後の現役セッションを巻き込まないための保険。
+JANITOR_GRACE="${AGENT_CAFFEINE_JANITOR_GRACE:-60}"
+
+mkdir -p "$HOLDERS_DIR"
+
+log() { printf '[agent-caffeine] %s\n' "$*" >&2; }
+
+process_matches() {
+  local pattern="$1"
+  [ -n "$pattern" ] || return 1
+  "$PGREP_BIN" -f "$pattern" >/dev/null 2>&1
+}
+
+sqlite_query() {
+  "$SQLITE3_BIN" "$CODEX_LOG_DB" "$1"
+}
+
+caffeinate_running() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+start_caffeinate() {
+  if caffeinate_running; then return 0; fi
+  # フック等の親シェルが終了しても生き残るよう nohup + disown で切り離す。
+  # macOS には setsid が無いため、これが最も移植性の高い detach 手段。
+  # shellcheck disable=SC2086
+  nohup caffeinate $CAFFEINATE_FLAGS >/dev/null 2>&1 &
+  echo $! >"$PID_FILE"
+  disown 2>/dev/null || true
+  log "started caffeinate (pid $(cat "$PID_FILE"), flags $CAFFEINATE_FLAGS)"
+}
+
+stop_caffeinate() {
+  if caffeinate_running; then
+    local pid
+    pid=$(cat "$PID_FILE")
+    kill "$pid" 2>/dev/null || true
+    log "stopped caffeinate (pid $pid)"
+  fi
+  rm -f "$PID_FILE"
+}
+
+reap() {
+  local f pid
+  for f in "$HOLDERS_DIR"/*; do
+    [ -e "$f" ] || continue
+    pid=$(basename "$f")
+    case "$pid" in
+    *[!0-9]*) continue ;; # 数値でない token は生存検証できないので残す
+    esac
+    kill -0 "$pid" 2>/dev/null || rm -f "$f"
+  done
+}
+
+count_holders() {
+  reap
+  find "$HOLDERS_DIR" -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+# claude / codex のどちらかでも生きていれば 0（=稼働中）を返す。
+# pgrep -f はコマンドライン全体を見るため、agent-caffeine 自身や pgrep には誤マッチしない。
+# 空パターンは「検出無効」。空のまま pgrep -f "" を呼ぶと全プロセスにマッチして
+# 常に true になってしまうため、必ず非空チェックを挟む。
+agents_alive() {
+  process_matches "$CLAUDE_PATTERN" && return 0
+  process_matches "$CODEX_PATTERN" && return 0
+  codex_logs_active && return 0
+  return 1
+}
+
+cmd_watch_codex_once() {
+  if [ -z "$CODEX_WATCH_PATTERN" ]; then
+    log "watch-codex-once: AGENT_CAFFEINE_CODEX_WATCH_PATTERN is empty"
+    return 1
+  fi
+
+  if process_matches "$CODEX_WATCH_PATTERN"; then
+    if [ ! -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
+      cmd_acquire "$CODEX_WATCH_TOKEN"
+      log "watch-codex-once: Codex detected, token=$CODEX_WATCH_TOKEN"
+    fi
+  else
+    if [ -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
+      cmd_release "$CODEX_WATCH_TOKEN"
+      log "watch-codex-once: Codex gone, token=$CODEX_WATCH_TOKEN"
+    fi
+  fi
+}
+
+cmd_watch_codex() {
+  if [ -z "$CODEX_WATCH_PATTERN" ]; then
+    log "watch-codex: AGENT_CAFFEINE_CODEX_WATCH_PATTERN is empty"
+    return 1
+  fi
+
+  trap '
+    if [ -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
+      cmd_release "$CODEX_WATCH_TOKEN" || true
+      log "watch-codex: released token=$CODEX_WATCH_TOKEN on exit"
+    fi
+    exit 0
+  ' INT TERM
+
+  while true; do
+    cmd_watch_codex_once
+    sleep "$CODEX_WATCH_INTERVAL"
+  done
+}
+
+codex_log_last_relevant_event() {
+  sqlite_query "
+    select id || '|' || feedback_log_body
+    from logs
+    where feedback_log_body like 'app-server event: item/started%'
+       or feedback_log_body like 'app-server event: item/agentMessage/delta%'
+       or feedback_log_body like 'app-server event: item/completed%'
+       or feedback_log_body like 'app-server event: turn/completed%'
+    order by id desc
+    limit 1;
+  "
+}
+
+codex_log_latest_id() {
+  sqlite_query "select coalesce(max(id), 0) from logs;"
+}
+
+codex_logs_active() {
+  [ -f "$CODEX_LOG_DB" ] || return 1
+
+  local last event_body
+  last=$(codex_log_last_relevant_event || true)
+  event_body="${last#*|}"
+
+  [ -n "$last" ] || return 1
+  [ "$last" != "$event_body" ] || return 1
+
+  [[ "$event_body" == app-server\ event:\ item/started* ]] && return 0
+  [[ "$event_body" == app-server\ event:\ item/agentMessage/delta* ]] && return 0
+  return 1
+}
+
+cmd_watch_codex_logs_once() {
+  if [ ! -f "$CODEX_LOG_DB" ]; then
+    log "watch-codex-logs-once: log DB not found: $CODEX_LOG_DB"
+    return 1
+  fi
+
+  local last latest_id event_id event_body
+  latest_id=$(codex_log_latest_id)
+  last=$(codex_log_last_relevant_event || true)
+  event_id="${last%%|*}"
+  event_body="${last#*|}"
+
+  if [ -z "$last" ] || [ "$last" = "$event_body" ]; then
+    event_id="0"
+    event_body=""
+  fi
+
+  if [ -n "$event_body" ] && [ "$event_id" -gt 0 ]; then
+    if [[ "$event_body" == app-server\ event:\ item/started* ]] ||
+      [[ "$event_body" == app-server\ event:\ item/agentMessage/delta* ]]; then
+      if [ ! -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
+        cmd_acquire "$CODEX_WATCH_TOKEN"
+        log "watch-codex-logs-once: turn started, token=$CODEX_WATCH_TOKEN log_id=$event_id"
+      fi
+    elif [[ "$event_body" == app-server\ event:\ item/completed* ]] ||
+      [[ "$event_body" == app-server\ event:\ turn/completed* ]]; then
+      if [ -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
+        cmd_release "$CODEX_WATCH_TOKEN"
+        log "watch-codex-logs-once: turn completed, token=$CODEX_WATCH_TOKEN log_id=$event_id"
+      fi
+    fi
+  fi
+
+  printf '%s\n' "$latest_id" >"$CODEX_LOG_CURSOR_FILE"
+}
+
+cmd_watch_codex_logs() {
+  if [ ! -f "$CODEX_LOG_DB" ]; then
+    log "watch-codex-logs: log DB not found: $CODEX_LOG_DB"
+    return 1
+  fi
+
+  trap '
+    if [ -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
+      cmd_release "$CODEX_WATCH_TOKEN" || true
+      log "watch-codex-logs: released token=$CODEX_WATCH_TOKEN on exit"
+    fi
+    exit 0
+  ' INT TERM
+
+  while true; do
+    cmd_watch_codex_logs_once
+    sleep "$CODEX_LOG_INTERVAL"
+  done
+}
+
+# crash-leak 対策の安全網。
+# ターン中に acquire したまま claude/codex が異常終了すると、session_id のような
+# 非数値 token は reap で消えず holder が残り caffeinate が動き続ける。
+# そこで「claude も codex も 1 つも生きていない」ときに限り、残存 holder を掃除して停止する。
+# Codex C 案を有効化した環境では、janitor 側にも `AGENT_CAFFEINE_CODEX_PATTERN` を与える。
+# どちらかが生きている間は、他人の holder を巻き込まないよう一切触らない（過剰停止の防止）。
+#
+# 安全弁: 全滅と判定しても、作られてから JANITOR_GRACE 秒未満の holder は消さない。
+# 検出パターンの誤判定や acquire 直後の取りこぼしで誤って「全滅」と見えても、
+# 起動直後の現役セッションを巻き込まない。古い holder が残らなければ caffeinate を止める。
+# ※ mtime 取得は macOS/BSD の `stat -f %m`（本ツールは darwin 専用: caffeinate/pmset）。
+cmd_janitor() {
+  reap # まず数値 token（PID 消滅）を通常掃除
+  if agents_alive; then
+    log "janitor: agents alive, holders=$(count_holders) (no-op)"
+    return 0
+  fi
+  local purged=0 kept=0 now age f
+  now=$(date +%s)
+  for f in "$HOLDERS_DIR"/*; do
+    [ -e "$f" ] || continue
+    age=$((now - $(stat -f %m "$f")))
+    if [ "$age" -ge "$JANITOR_GRACE" ]; then
+      rm -f "$f"
+      purged=$((purged + 1))
+    else
+      kept=$((kept + 1))
+    fi
+  done
+  if [ "$(count_holders)" -eq 0 ]; then
+    stop_caffeinate
+    log "janitor: no agents alive, purged $purged leaked holder(s), caffeinate stopped"
+  else
+    log "janitor: no agents alive, purged $purged / kept $kept fresh holder(s) within ${JANITOR_GRACE}s grace"
+  fi
+}
+
+cmd_acquire() {
+  local token="${1:-$PPID}"
+  : >"$HOLDERS_DIR/$token"
+  start_caffeinate
+  log "acquire token=$token holders=$(count_holders)"
+}
+
+cmd_release() {
+  local token="${1:-$PPID}"
+  rm -f "$HOLDERS_DIR/$token"
+  if [ "$(count_holders)" -eq 0 ]; then
+    stop_caffeinate
+  fi
+  log "release token=$token holders=$(count_holders)"
+}
+
+cmd_status() {
+  if caffeinate_running; then
+    echo "caffeinate: RUNNING (pid $(cat "$PID_FILE"), flags $CAFFEINATE_FLAGS)"
+  else
+    echo "caffeinate: stopped"
+  fi
+  echo "holders: $(count_holders)"
+  local f
+  for f in "$HOLDERS_DIR"/*; do
+    [ -e "$f" ] || continue
+    echo "  - $(basename "$f")"
+  done
+}
+
+case "${1:-}" in
+acquire)
+  shift
+  cmd_acquire "${1:-}"
+  ;;
+release)
+  shift
+  cmd_release "${1:-}"
+  ;;
+status) cmd_status ;;
+reap)
+  reap
+  echo "holders: $(count_holders)"
+  ;;
+janitor) cmd_janitor ;;
+watch-codex-once) cmd_watch_codex_once ;;
+watch-codex) cmd_watch_codex ;;
+watch-codex-logs-once) cmd_watch_codex_logs_once ;;
+watch-codex-logs) cmd_watch_codex_logs ;;
+*)
+  echo "usage: agent-caffeine {acquire|release|status|reap|janitor|watch-codex-once|watch-codex|watch-codex-logs-once|watch-codex-logs} [token]" >&2
+  exit 1
+  ;;
+esac

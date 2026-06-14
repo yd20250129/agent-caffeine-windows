@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Codex(C 案) 用の常駐 watch。
+  ~/.codex/logs_2.sqlite を監視し、turn 中だけ holder=codex を保持する。
+
+  意味論:
+    Claude = ターン中のみ
+    Codex = ターン中のみ
+
+  使い方:
+    cp launchd/com.yudai.agent-caffeine-codex.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.yudai.agent-caffeine-codex.plist
+    # 解除: launchctl unload ~/Library/LaunchAgents/com.yudai.agent-caffeine-codex.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.yudai.agent-caffeine-codex</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/yudai/local_development/02_Personal_Projects/agent-caffeine/src/agent-caffeine</string>
+    <string>watch-codex-logs</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/yudai</string>
+    <key>AGENT_CAFFEINE_CODEX_LOG_DB</key>
+    <string>/Users/yudai/.codex/logs_2.sqlite</string>
+    <key>AGENT_CAFFEINE_CODEX_LOG_INTERVAL</key>
+    <string>2</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/agent-caffeine-codex.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/agent-caffeine-codex.err.log</string>
+</dict>
+</plist>
