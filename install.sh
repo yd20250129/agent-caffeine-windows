@@ -14,8 +14,12 @@ LINK="$BIN_DIR/agent-caffeine"
 
 chmod +x "$SRC"
 mkdir -p "$BIN_DIR"
-ln -sf "$SRC" "$LINK"
-echo "linked: $LINK -> $SRC"
+if ln -sf "$SRC" "$LINK" 2>/dev/null; then
+  echo "linked: $LINK -> $SRC"
+else
+  cp "$SRC" "$LINK"
+  echo "copied: $LINK (symlink unavailable — enable Developer Mode for symlinks)"
+fi
 echo
 
 if ! printf '%s' ":$PATH:" | grep -q ":$BIN_DIR:"; then
@@ -26,43 +30,35 @@ fi
 
 OS="$(uname -s)"
 
-if [ "$OS" = "Linux" ]; then
-  SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
-  mkdir -p "$SYSTEMD_USER_DIR"
-  cp "$PROJECT_DIR/systemd/"*.service "$PROJECT_DIR/systemd/"*.timer "$SYSTEMD_USER_DIR/"
-  systemctl --user daemon-reload
-  systemctl --user enable --now agent-caffeine-janitor.timer
-  echo "enabled: agent-caffeine-janitor.timer"
-  echo
-  echo "Codex log watcher は以下で手動起動（~/.codex/logs_2.sqlite が必要）:"
-  echo "  systemctl --user enable --now agent-caffeine-watch-codex.service"
-  echo
-fi
+case "$OS" in
+  MINGW*|MSYS*|CYGWIN*)
+    TASK_DIR="$PROJECT_DIR/task-scheduler"
+    schtasks.exe /Create /XML "$(cygpath -w "$TASK_DIR/agent-caffeine-janitor.xml")" \
+      /TN "agent-caffeine-janitor" /F
+    echo "registered: agent-caffeine-janitor (Task Scheduler)"
+    echo
+    echo "Codex log watcher は以下で手動登録（~/.codex/logs_2.sqlite が必要）:"
+    echo "  schtasks /Create /XML task-scheduler/agent-caffeine-watch-codex.xml /TN agent-caffeine-watch-codex /F"
+    echo
+    ;;
+esac
 
 cat <<'EOF'
 --- 次のステップ -----------------------------------------------------------
 
-[B 案: フック駆動 / 推奨] Claude Code
+[Claude Code フック設定]
   ~/.claude/settings.json の hooks に手動で追記（既存フックは消さないこと）:
 
     UserPromptSubmit -> agent-caffeine acquire <session_id>
     Stop             -> agent-caffeine release <session_id>
 
-  ※ 現在の実装は「ターン中 = 稼働中」。session_id は hook JSON から取る。
+  ※ jq が必要です。未インストールの場合: winget install jqlang.jq
 
-[C 案] Codex (Linux)
-  systemctl --user enable --now agent-caffeine-watch-codex.service
+[Codex 監視]
+  タスクスケジューラへ登録（~/.codex/logs_2.sqlite が必要）:
+    schtasks /Create /XML task-scheduler\agent-caffeine-watch-codex.xml /TN agent-caffeine-watch-codex /F
 
-[C 案] Codex (macOS)
-  cp launchd/com.yudai.agent-caffeine-codex.plist ~/Library/LaunchAgents/
-  launchctl load ~/Library/LaunchAgents/com.yudai.agent-caffeine-codex.plist
-
-[janitor] macOS のみ手動インストールが必要（Linux は install.sh が自動設定）:
-  cp launchd/com.yudai.agent-caffeine.plist ~/Library/LaunchAgents/
-  launchctl load ~/Library/LaunchAgents/com.yudai.agent-caffeine.plist
-
-運用手順:
-  00_Docs/09_operations.md を参照
+  ※ sqlite3 が必要です。未インストールの場合: winget install SQLite.SQLite
 
 ----------------------------------------------------------------------------
 動作確認:

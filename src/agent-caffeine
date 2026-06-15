@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agent-caffeine — エージェント稼働中だけスリープを抑止する（Linux対応版）
+# agent-caffeine — エージェント稼働中だけスリープを抑止する（Windows Git Bash版）
 #
 # 設計の肝: 参照カウント方式
 #   Claude / Codex を worktree で並行稼働させるため、単純な ON/OFF フラグだと
@@ -37,16 +37,14 @@ STATE_DIR="${AGENT_CAFFEINE_STATE:-$HOME/.local/state/agent-caffeine}"
 HOLDERS_DIR="$STATE_DIR/holders"
 PID_FILE="$STATE_DIR/caffeinate.pid"
 CAFFEINATE_FLAGS="${AGENT_CAFFEINE_FLAGS:-}"
-PGREP_BIN="${AGENT_CAFFEINE_PGREP_BIN:-pgrep}"
-# janitor 用のプロセス検出パターン（2026-06-14 実機確認・VSCode 拡張）。
-CLAUDE_PATTERN="${AGENT_CAFFEINE_CLAUDE_PATTERN:-native-binary/claude}"
+CLAUDE_PATTERN="${AGENT_CAFFEINE_CLAUDE_PATTERN:-win32-x64/claude}"
 # Codex の PGREP 検出は既定で無効（空）。理由: codex の app-server は VSCode を開いている間
 # ずっと常駐し「稼働中」と誤検出される。有効にすると agents_alive がほぼ永久に true となり、
 # janitor が Claude のリークを一切掃除できなくなる（存在意義が消える）。Codex の活性判定は
 # 既定で logs DB を使い、CODEX_PATTERN は互換用にだけ残す。
 CODEX_PATTERN="${AGENT_CAFFEINE_CODEX_PATTERN:-}"
 # Codex の旧 pgrep watch ループ用。logs DB 監視へ移行済みだが、互換のため残す。
-CODEX_WATCH_PATTERN="${AGENT_CAFFEINE_CODEX_WATCH_PATTERN-openai.chatgpt.*linux-x64/codex}"
+CODEX_WATCH_PATTERN="${AGENT_CAFFEINE_CODEX_WATCH_PATTERN-openai.chatgpt.*win32-x64/codex}"
 CODEX_WATCH_TOKEN="${AGENT_CAFFEINE_CODEX_WATCH_TOKEN:-codex}"
 CODEX_WATCH_INTERVAL="${AGENT_CAFFEINE_CODEX_WATCH_INTERVAL:-15}"
 CODEX_LOG_DB="${AGENT_CAFFEINE_CODEX_LOG_DB:-$HOME/.codex/logs_2.sqlite}"
@@ -65,7 +63,9 @@ log() { printf '[agent-caffeine] %s\n' "$*" >&2; }
 process_matches() {
   local pattern="$1"
   [ -n "$pattern" ] || return 1
-  "$PGREP_BIN" -f "$pattern" >/dev/null 2>&1
+  powershell.exe -NoProfile -Command \
+    "Get-Process | Where-Object { \$_.Path -match '$pattern' } | Select-Object -First 1" \
+    2>/dev/null | grep -q .
 }
 
 sqlite_query() {
@@ -81,15 +81,16 @@ caffeinate_running() {
 
 start_caffeinate() {
   if caffeinate_running; then return 0; fi
-  if command -v systemd-inhibit >/dev/null 2>&1; then
-    nohup systemd-inhibit --what=sleep:idle --who=agent-caffeine --why="AI agent running" --mode=block sleep infinity >/dev/null 2>&1 &
-  else
-    # systemd-inhibit が利用不可の環境（EC2等）ではno-opとしてPIDファイルのみ作成
-    sleep infinity >/dev/null 2>&1 &
-  fi
+  # SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_AWAYMODE_REQUIRED) でスリープを抑止。
+  # 0x80000003 = ES_CONTINUOUS(0x80000000) | ES_SYSTEM_REQUIRED(0x01) | ES_AWAYMODE_REQUIRED(0x02)
+  nohup powershell.exe -NoProfile -Command "
+    Add-Type -Namespace Win32 -Name Power -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint s);';
+    [Win32.Power]::SetThreadExecutionState(0x80000003);
+    while(\$true){ Start-Sleep 30; [Win32.Power]::SetThreadExecutionState(0x80000003) }
+  " >/dev/null 2>&1 &
   echo $! >"$PID_FILE"
   disown 2>/dev/null || true
-  log "started inhibit (pid $(cat "$PID_FILE"))"
+  log "started sleep-inhibit (pid $(cat "$PID_FILE"))"
 }
 
 stop_caffeinate() {
@@ -97,7 +98,7 @@ stop_caffeinate() {
     local pid
     pid=$(cat "$PID_FILE")
     kill "$pid" 2>/dev/null || true
-    log "stopped inhibit (pid $pid)"
+    log "stopped sleep-inhibit (pid $pid)"
   fi
   rm -f "$PID_FILE"
 }
@@ -312,9 +313,9 @@ cmd_release() {
 
 cmd_status() {
   if caffeinate_running; then
-    echo "inhibit: RUNNING (pid $(cat "$PID_FILE"))"
+    echo "sleep-inhibit: RUNNING (pid $(cat "$PID_FILE"))"
   else
-    echo "inhibit: stopped"
+    echo "sleep-inhibit: stopped"
   fi
   echo "holders: $(count_holders)"
   local f
