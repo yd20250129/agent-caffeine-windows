@@ -1,0 +1,8 @@
+[Unit]
+Description=agent-caffeine janitor (crash-leak cleanup)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-caffeine janitor
+StandardOutput=journal
+StandardError=journal

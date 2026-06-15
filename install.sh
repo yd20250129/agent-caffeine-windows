@@ -24,6 +24,21 @@ if ! printf '%s' ":$PATH:" | grep -q ":$BIN_DIR:"; then
   echo
 fi
 
+OS="$(uname -s)"
+
+if [ "$OS" = "Linux" ]; then
+  SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
+  mkdir -p "$SYSTEMD_USER_DIR"
+  cp "$PROJECT_DIR/systemd/"*.service "$PROJECT_DIR/systemd/"*.timer "$SYSTEMD_USER_DIR/"
+  systemctl --user daemon-reload
+  systemctl --user enable --now agent-caffeine-janitor.timer
+  echo "enabled: agent-caffeine-janitor.timer"
+  echo
+  echo "Codex log watcher は以下で手動起動（~/.codex/logs_2.sqlite が必要）:"
+  echo "  systemctl --user enable --now agent-caffeine-watch-codex.service"
+  echo
+fi
+
 cat <<'EOF'
 --- 次のステップ -----------------------------------------------------------
 
@@ -35,14 +50,14 @@ cat <<'EOF'
 
   ※ 現在の実装は「ターン中 = 稼働中」。session_id は hook JSON から取る。
 
-[C 案] Codex
-  現在の実装は ~/.codex/logs_2.sqlite 監視 + launchd。
-    cp launchd/com.yudai.agent-caffeine-codex.plist ~/Library/LaunchAgents/
-    launchctl load ~/Library/LaunchAgents/com.yudai.agent-caffeine-codex.plist
+[C 案] Codex (Linux)
+  systemctl --user enable --now agent-caffeine-watch-codex.service
 
-  notify は触らない。logs DB の app-server event を見て turn 精度で追従する。
+[C 案] Codex (macOS)
+  cp launchd/com.yudai.agent-caffeine-codex.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.yudai.agent-caffeine-codex.plist
 
-[janitor]
+[janitor] macOS のみ手動インストールが必要（Linux は install.sh が自動設定）:
   cp launchd/com.yudai.agent-caffeine.plist ~/Library/LaunchAgents/
   launchctl load ~/Library/LaunchAgents/com.yudai.agent-caffeine.plist
 

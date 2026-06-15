@@ -1,0 +1,14 @@
+[Unit]
+Description=agent-caffeine Codex log watcher
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agent-caffeine watch-codex-logs
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

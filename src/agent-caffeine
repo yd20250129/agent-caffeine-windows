@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agent-caffeine — エージェント稼働中だけ Mac を起こす
+# agent-caffeine — エージェント稼働中だけスリープを抑止する（Linux対応版）
 #
 # 設計の肝: 参照カウント方式
 #   Claude / Codex を worktree で並行稼働させるため、単純な ON/OFF フラグだと
@@ -36,9 +36,7 @@ set -euo pipefail
 STATE_DIR="${AGENT_CAFFEINE_STATE:-$HOME/.local/state/agent-caffeine}"
 HOLDERS_DIR="$STATE_DIR/holders"
 PID_FILE="$STATE_DIR/caffeinate.pid"
-# 既定は idle sleep 防止(-i) + AC時のsystem sleep防止(-s)。
-# -s は battery 上では macOS 側で無効化されるため、AC 時だけ効く。
-CAFFEINATE_FLAGS="${AGENT_CAFFEINE_FLAGS:--i -s}"
+CAFFEINATE_FLAGS="${AGENT_CAFFEINE_FLAGS:-}"
 PGREP_BIN="${AGENT_CAFFEINE_PGREP_BIN:-pgrep}"
 # janitor 用のプロセス検出パターン（2026-06-14 実機確認・VSCode 拡張）。
 CLAUDE_PATTERN="${AGENT_CAFFEINE_CLAUDE_PATTERN:-native-binary/claude}"
@@ -48,7 +46,7 @@ CLAUDE_PATTERN="${AGENT_CAFFEINE_CLAUDE_PATTERN:-native-binary/claude}"
 # 既定で logs DB を使い、CODEX_PATTERN は互換用にだけ残す。
 CODEX_PATTERN="${AGENT_CAFFEINE_CODEX_PATTERN:-}"
 # Codex の旧 pgrep watch ループ用。logs DB 監視へ移行済みだが、互換のため残す。
-CODEX_WATCH_PATTERN="${AGENT_CAFFEINE_CODEX_WATCH_PATTERN-openai.chatgpt.*codex}"
+CODEX_WATCH_PATTERN="${AGENT_CAFFEINE_CODEX_WATCH_PATTERN-openai.chatgpt.*linux-x64/codex}"
 CODEX_WATCH_TOKEN="${AGENT_CAFFEINE_CODEX_WATCH_TOKEN:-codex}"
 CODEX_WATCH_INTERVAL="${AGENT_CAFFEINE_CODEX_WATCH_INTERVAL:-15}"
 CODEX_LOG_DB="${AGENT_CAFFEINE_CODEX_LOG_DB:-$HOME/.codex/logs_2.sqlite}"
@@ -83,13 +81,15 @@ caffeinate_running() {
 
 start_caffeinate() {
   if caffeinate_running; then return 0; fi
-  # フック等の親シェルが終了しても生き残るよう nohup + disown で切り離す。
-  # macOS には setsid が無いため、これが最も移植性の高い detach 手段。
-  # shellcheck disable=SC2086
-  nohup caffeinate $CAFFEINATE_FLAGS >/dev/null 2>&1 &
+  if command -v systemd-inhibit >/dev/null 2>&1; then
+    nohup systemd-inhibit --what=sleep:idle --who=agent-caffeine --why="AI agent running" --mode=block sleep infinity >/dev/null 2>&1 &
+  else
+    # systemd-inhibit が利用不可の環境（EC2等）ではno-opとしてPIDファイルのみ作成
+    sleep infinity >/dev/null 2>&1 &
+  fi
   echo $! >"$PID_FILE"
   disown 2>/dev/null || true
-  log "started caffeinate (pid $(cat "$PID_FILE"), flags $CAFFEINATE_FLAGS)"
+  log "started inhibit (pid $(cat "$PID_FILE"))"
 }
 
 stop_caffeinate() {
@@ -97,7 +97,7 @@ stop_caffeinate() {
     local pid
     pid=$(cat "$PID_FILE")
     kill "$pid" 2>/dev/null || true
-    log "stopped caffeinate (pid $pid)"
+    log "stopped inhibit (pid $pid)"
   fi
   rm -f "$PID_FILE"
 }
@@ -278,7 +278,7 @@ cmd_janitor() {
   now=$(date +%s)
   for f in "$HOLDERS_DIR"/*; do
     [ -e "$f" ] || continue
-    age=$((now - $(stat -f %m "$f")))
+    age=$((now - $(stat --format=%Y "$f")))
     if [ "$age" -ge "$JANITOR_GRACE" ]; then
       rm -f "$f"
       purged=$((purged + 1))
@@ -312,9 +312,9 @@ cmd_release() {
 
 cmd_status() {
   if caffeinate_running; then
-    echo "caffeinate: RUNNING (pid $(cat "$PID_FILE"), flags $CAFFEINATE_FLAGS)"
+    echo "inhibit: RUNNING (pid $(cat "$PID_FILE"))"
   else
-    echo "caffeinate: stopped"
+    echo "inhibit: stopped"
   fi
   echo "holders: $(count_holders)"
   local f
