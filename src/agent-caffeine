@@ -81,12 +81,23 @@ caffeinate_running() {
 
 start_caffeinate() {
   if caffeinate_running; then return 0; fi
-  # SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_AWAYMODE_REQUIRED) でスリープを抑止。
+  # 二重対策:
+  # 1) SetThreadExecutionState でシステムスリープを抑止（GPO非管理環境向け）
+  # 2) マウスを1px微動させてユーザーアクティビティを偽装（GPO管理環境向け）
+  #    GPOで「操作なしXX分でスリープ」が強制されていても、アクティビティ検知で回避できる。
+  #    マウスは元の位置に即戻すため、作業の邪魔にならない。
   # 0x80000003 = ES_CONTINUOUS(0x80000000) | ES_SYSTEM_REQUIRED(0x01) | ES_AWAYMODE_REQUIRED(0x02)
   nohup powershell.exe -NoProfile -Command "
     Add-Type -Namespace Win32 -Name Power -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint s);';
+    Add-Type -AssemblyName System.Windows.Forms;
     [Win32.Power]::SetThreadExecutionState(0x80000003);
-    while(\$true){ Start-Sleep 30; [Win32.Power]::SetThreadExecutionState(0x80000003) }
+    while(\$true){
+      Start-Sleep 60;
+      [Win32.Power]::SetThreadExecutionState(0x80000003);
+      \$pos = [System.Windows.Forms.Cursor]::Position;
+      [System.Windows.Forms.Cursor]::Position = [System.Drawing.Point]::new(\$pos.X + 1, \$pos.Y);
+      [System.Windows.Forms.Cursor]::Position = \$pos
+    }
   " >/dev/null 2>&1 &
   echo $! >"$PID_FILE"
   disown 2>/dev/null || true
