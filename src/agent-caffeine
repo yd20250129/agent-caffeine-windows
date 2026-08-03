@@ -1,56 +1,46 @@
 #!/usr/bin/env bash
 # agent-caffeine — エージェント稼働中だけスリープを抑止する（Windows Git Bash版）
 #
-# 設計の肝: 参照カウント方式
-#   Claude / Codex を worktree で並行稼働させるため、単純な ON/OFF フラグだと
+# 設計の肝: 参照カウント方式 + daemon分離
+#   Claude を worktree で並行稼働させるため、単純な ON/OFF フラグだと
 #   片方のセッション終了で caffeinate を止めてしまい、もう片方が稼働中なのに
 #   スリープしてしまう。そこで「holder（保持者）」をトークン単位で登録し、
-#   holder が 1 つでも生きている間だけ caffeinate を動かす。
+#   holder が 1 つでも生きている間だけスリープ抑止を動かす。
+#
+#   スリープ抑止の実体はタスクスケジューラでログオン時起動される daemon.ps1。
+#   agent-caffeine は holder ファイルの作成/削除のみを行い、プロセス起動には
+#   関与しない。理由: Git Bash の `nohup powershell &` で切り離すと
+#   インタラクティブデスクトップとの結び付きを失い SendKeys が silent-fail する。
+#   タスクスケジューラの LogonTrigger + InteractiveToken 経由なら結び付きが
+#   維持され、F15 / マウス微動が確実にOSのIdleTimerをリセットできる。
 #
 # 使い方:
-#   agent-caffeine acquire [token]   # holder を登録し caffeinate を起動（冪等）
-#   agent-caffeine release [token]   # holder を解除し、0 になれば caffeinate 停止
-#   agent-caffeine status            # 状態と holder 一覧を表示
-#   agent-caffeine reap              # 死んだ holder（PID 消滅）を掃除
-#   agent-caffeine janitor           # claude/codex が皆無なら残存 holder を全消去（crash-leak 対策）
+#   agent-caffeine acquire [token]   # holder を登録（daemon が拾って抑止開始）
+#   agent-caffeine release [token]   # holder を解除（holder=0 で daemon が抑止停止）
+#   agent-caffeine status            # 状態と holder 一覧、daemon プロセス生存を表示
+#   agent-caffeine reap              # 死んだ holder（数値PID消滅）を掃除
+#   agent-caffeine janitor           # claude が皆無なら残存 holder を全消去（crash-leak 対策）
 #
-# token を省略すると呼び出し元の PPID を使う。Claude フックからは session_id、
-# Codex からはセッション識別子など「生きている間ユニーク」な値を渡すのが堅い。
+# token を省略すると呼び出し元の PPID を使う。Claude フックからは session_id など
+# 「生きている間ユニーク」な値を渡すのが堅い。
 # token が数値（PID）の場合のみ、reap でプロセス生存を検証して自動掃除する。
 #
 # 環境変数:
 #   AGENT_CAFFEINE_STATE           状態ディレクトリ（default: ~/.local/state/agent-caffeine）
-#   AGENT_CAFFEINE_FLAGS           caffeinate のフラグ（default: -i -s）
-#   AGENT_CAFFEINE_CLAUDE_PATTERN  janitor の Claude 検出パターン（pgrep -f）
-#   AGENT_CAFFEINE_CODEX_PATTERN   janitor の Codex 検出パターン（pgrep -f / 既定は空=無効）
+#   AGENT_CAFFEINE_CLAUDE_PATTERN  janitor の Claude 検出パターン（PowerShell Get-Process Path）
 #   AGENT_CAFFEINE_JANITOR_GRACE   janitor が holder を消さずに猶予する秒数（default: 60）
-#   AGENT_CAFFEINE_CODEX_WATCH_PATTERN   Codex watch 用の検出パターン（default: openai.chatgpt.*codex）
-#   AGENT_CAFFEINE_CODEX_WATCH_TOKEN     Codex watch が使う holder token（default: codex）
-#   AGENT_CAFFEINE_CODEX_WATCH_INTERVAL  Codex watch のポーリング秒数（default: 15）
-#   AGENT_CAFFEINE_CODEX_LOG_DB          Codex の logs sqlite path（default: ~/.codex/logs_2.sqlite）
-#   AGENT_CAFFEINE_CODEX_LOG_INTERVAL    Codex log watch のポーリング秒数（default: 2）
-#   AGENT_CAFFEINE_PGREP_BIN             テスト用。既定は pgrep
+#   AGENT_CAFFEINE_PGREP_BIN       テスト用。既定は pgrep
 
 set -euo pipefail
 
 STATE_DIR="${AGENT_CAFFEINE_STATE:-$HOME/.local/state/agent-caffeine}"
 HOLDERS_DIR="$STATE_DIR/holders"
-PID_FILE="$STATE_DIR/caffeinate.pid"
-CAFFEINATE_FLAGS="${AGENT_CAFFEINE_FLAGS:-}"
-CLAUDE_PATTERN="${AGENT_CAFFEINE_CLAUDE_PATTERN:-win32-x64/claude}"
-# Codex の PGREP 検出は既定で無効（空）。理由: codex の app-server は VSCode を開いている間
-# ずっと常駐し「稼働中」と誤検出される。有効にすると agents_alive がほぼ永久に true となり、
-# janitor が Claude のリークを一切掃除できなくなる（存在意義が消える）。Codex の活性判定は
-# 既定で logs DB を使い、CODEX_PATTERN は互換用にだけ残す。
-CODEX_PATTERN="${AGENT_CAFFEINE_CODEX_PATTERN:-}"
-# Codex の旧 pgrep watch ループ用。logs DB 監視へ移行済みだが、互換のため残す。
-CODEX_WATCH_PATTERN="${AGENT_CAFFEINE_CODEX_WATCH_PATTERN-openai.chatgpt.*win32-x64/codex}"
-CODEX_WATCH_TOKEN="${AGENT_CAFFEINE_CODEX_WATCH_TOKEN:-codex}"
-CODEX_WATCH_INTERVAL="${AGENT_CAFFEINE_CODEX_WATCH_INTERVAL:-15}"
-CODEX_LOG_DB="${AGENT_CAFFEINE_CODEX_LOG_DB:-$HOME/.codex/logs_2.sqlite}"
-CODEX_LOG_INTERVAL="${AGENT_CAFFEINE_CODEX_LOG_INTERVAL:-2}"
-CODEX_LOG_CURSOR_FILE="$STATE_DIR/codex-log-cursor"
-SQLITE3_BIN="${AGENT_CAFFEINE_SQLITE3_BIN:-sqlite3}"
+# daemon.ps1 が自身の PID を書き出すファイル。存在＆生存で daemon 稼働中とみなす。
+DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
+# PS の -match は正規表現。Windows パスは `\` セパレータなので `/` を含めないこと。
+# 旧デフォルト `win32-x64/claude` は絶対にマッチしなかった (Path=...anthropic.claude-code-*-win32-x64\resources\...).
+# `claude-code.*win32-x64` はプロセスパスに含まれる安定した部分文字列。
+CLAUDE_PATTERN="${AGENT_CAFFEINE_CLAUDE_PATTERN:-claude-code.*win32-x64}"
 # janitor の安全弁: 作られてから GRACE 秒未満の holder は消さない。
 # 検出パターンの誤判定や acquire 直後の取りこぼしで「全滅」と誤認しても、
 # 起動直後の現役セッションを巻き込まないための保険。
@@ -63,55 +53,41 @@ log() { printf '[agent-caffeine] %s\n' "$*" >&2; }
 process_matches() {
   local pattern="$1"
   [ -n "$pattern" ] || return 1
-  powershell.exe -NoProfile -Command \
+  # -WindowStyle Hidden はコンソール表示を抑止する保険。janitor はさらに wscript+VBS
+  # でラップされているため通常はコンソール自体が親から与えられないが、手動起動時や
+  # 環境差で親コンソールが継承されると一瞬フラッシュするため念のため付ける。
+  powershell.exe -NoProfile -WindowStyle Hidden -Command \
     "Get-Process | Where-Object { \$_.Path -match '$pattern' } | Select-Object -First 1" \
     2>/dev/null | grep -q .
 }
 
-sqlite_query() {
-  "$SQLITE3_BIN" "$CODEX_LOG_DB" "$1"
-}
-
-caffeinate_running() {
-  [ -f "$PID_FILE" ] || return 1
+# daemon.ps1 (タスクスケジューラで常駐) の生存確認。
+# daemon が書いた PID は Windows のPID。Git Bash の `kill -0` は Windows PID を
+# そのまま解釈できないため、PowerShell 経由で確認する。
+daemon_running() {
+  [ -f "$DAEMON_PID_FILE" ] || return 1
   local pid
-  pid=$(cat "$PID_FILE" 2>/dev/null || true)
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+  pid=$(cat "$DAEMON_PID_FILE" 2>/dev/null || true)
+  [ -n "$pid" ] || return 1
+  powershell.exe -NoProfile -WindowStyle Hidden -Command "if (Get-Process -Id $pid -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" 2>/dev/null
 }
 
-start_caffeinate() {
-  if caffeinate_running; then return 0; fi
-  # 二重対策:
-  # 1) SetThreadExecutionState でシステムスリープを抑止（GPO非管理環境向け）
-  # 2) マウスを1px微動させてユーザーアクティビティを偽装（GPO管理環境向け）
-  #    GPOで「操作なしXX分でスリープ」が強制されていても、アクティビティ検知で回避できる。
-  #    マウスは元の位置に即戻すため、作業の邪魔にならない。
-  # 0x80000003 = ES_CONTINUOUS(0x80000000) | ES_SYSTEM_REQUIRED(0x01) | ES_AWAYMODE_REQUIRED(0x02)
-  nohup powershell.exe -NoProfile -Command "
-    Add-Type -Namespace Win32 -Name Power -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint s);';
-    Add-Type -AssemblyName System.Windows.Forms;
-    [Win32.Power]::SetThreadExecutionState(0x80000003);
-    while(\$true){
-      Start-Sleep 60;
-      [Win32.Power]::SetThreadExecutionState(0x80000003);
-      \$pos = [System.Windows.Forms.Cursor]::Position;
-      [System.Windows.Forms.Cursor]::Position = [System.Drawing.Point]::new(\$pos.X + 1, \$pos.Y);
-      [System.Windows.Forms.Cursor]::Position = \$pos
-    }
-  " >/dev/null 2>&1 &
-  echo $! >"$PID_FILE"
-  disown 2>/dev/null || true
-  log "started sleep-inhibit (pid $(cat "$PID_FILE"))"
-}
+# daemon 分離設計のため、agent-caffeine 側では起動/停止を行わない。
+# holder を作れば daemon が次のポーリング (60秒) で拾って抑止を開始する。
+# holder=0 になれば daemon が抑止を停止する（daemon プロセス自体は動き続ける）。
+start_caffeinate() { :; }
+stop_caffeinate() { :; }
 
-stop_caffeinate() {
-  if caffeinate_running; then
-    local pid
-    pid=$(cat "$PID_FILE")
-    kill "$pid" 2>/dev/null || true
-    log "stopped sleep-inhibit (pid $pid)"
-  fi
-  rm -f "$PID_FILE"
+# daemon が死んでいたらタスクスケジューラ経由で起こす。冪等 (既に生きていれば
+# daemon.ps1 側で「already running, exiting」と判断して黙って抜ける)。
+# 死因例: スリープ復帰時の強制終了、想定外の例外、手動 taskkill 等。
+# janitor から holder>0 の状態で呼ばれることを想定している。
+ensure_daemon() {
+  if daemon_running; then return 0; fi
+  # 古い pid ファイルが残っているとdaemon.ps1が起動を拒否するので消しておく
+  rm -f "$DAEMON_PID_FILE"
+  schtasks.exe //Run //TN "agent-caffeine-daemon" >/dev/null 2>&1 || true
+  log "ensure_daemon: dead daemon detected, requested restart via Task Scheduler"
 }
 
 reap() {
@@ -131,158 +107,32 @@ count_holders() {
   find "$HOLDERS_DIR" -type f 2>/dev/null | wc -l | tr -d ' '
 }
 
-# claude / codex のどちらかでも生きていれば 0（=稼働中）を返す。
-# pgrep -f はコマンドライン全体を見るため、agent-caffeine 自身や pgrep には誤マッチしない。
-# 空パターンは「検出無効」。空のまま pgrep -f "" を呼ぶと全プロセスにマッチして
-# 常に true になってしまうため、必ず非空チェックを挟む。
+# claude が生きていれば 0（=稼働中）を返す。
+# 空パターンは「検出無効」扱い。
 agents_alive() {
   process_matches "$CLAUDE_PATTERN" && return 0
-  process_matches "$CODEX_PATTERN" && return 0
-  codex_logs_active && return 0
   return 1
-}
-
-cmd_watch_codex_once() {
-  if [ -z "$CODEX_WATCH_PATTERN" ]; then
-    log "watch-codex-once: AGENT_CAFFEINE_CODEX_WATCH_PATTERN is empty"
-    return 1
-  fi
-
-  if process_matches "$CODEX_WATCH_PATTERN"; then
-    if [ ! -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
-      cmd_acquire "$CODEX_WATCH_TOKEN"
-      log "watch-codex-once: Codex detected, token=$CODEX_WATCH_TOKEN"
-    fi
-  else
-    if [ -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
-      cmd_release "$CODEX_WATCH_TOKEN"
-      log "watch-codex-once: Codex gone, token=$CODEX_WATCH_TOKEN"
-    fi
-  fi
-}
-
-cmd_watch_codex() {
-  if [ -z "$CODEX_WATCH_PATTERN" ]; then
-    log "watch-codex: AGENT_CAFFEINE_CODEX_WATCH_PATTERN is empty"
-    return 1
-  fi
-
-  trap '
-    if [ -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
-      cmd_release "$CODEX_WATCH_TOKEN" || true
-      log "watch-codex: released token=$CODEX_WATCH_TOKEN on exit"
-    fi
-    exit 0
-  ' INT TERM
-
-  while true; do
-    cmd_watch_codex_once
-    sleep "$CODEX_WATCH_INTERVAL"
-  done
-}
-
-codex_log_last_relevant_event() {
-  sqlite_query "
-    select id || '|' || feedback_log_body
-    from logs
-    where feedback_log_body like 'app-server event: item/started%'
-       or feedback_log_body like 'app-server event: item/agentMessage/delta%'
-       or feedback_log_body like 'app-server event: item/completed%'
-       or feedback_log_body like 'app-server event: turn/completed%'
-    order by id desc
-    limit 1;
-  "
-}
-
-codex_log_latest_id() {
-  sqlite_query "select coalesce(max(id), 0) from logs;"
-}
-
-codex_logs_active() {
-  [ -f "$CODEX_LOG_DB" ] || return 1
-
-  local last event_body
-  last=$(codex_log_last_relevant_event || true)
-  event_body="${last#*|}"
-
-  [ -n "$last" ] || return 1
-  [ "$last" != "$event_body" ] || return 1
-
-  [[ "$event_body" == app-server\ event:\ item/started* ]] && return 0
-  [[ "$event_body" == app-server\ event:\ item/agentMessage/delta* ]] && return 0
-  return 1
-}
-
-cmd_watch_codex_logs_once() {
-  if [ ! -f "$CODEX_LOG_DB" ]; then
-    log "watch-codex-logs-once: log DB not found: $CODEX_LOG_DB"
-    return 1
-  fi
-
-  local last latest_id event_id event_body
-  latest_id=$(codex_log_latest_id)
-  last=$(codex_log_last_relevant_event || true)
-  event_id="${last%%|*}"
-  event_body="${last#*|}"
-
-  if [ -z "$last" ] || [ "$last" = "$event_body" ]; then
-    event_id="0"
-    event_body=""
-  fi
-
-  if [ -n "$event_body" ] && [ "$event_id" -gt 0 ]; then
-    if [[ "$event_body" == app-server\ event:\ item/started* ]] ||
-      [[ "$event_body" == app-server\ event:\ item/agentMessage/delta* ]]; then
-      if [ ! -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
-        cmd_acquire "$CODEX_WATCH_TOKEN"
-        log "watch-codex-logs-once: turn started, token=$CODEX_WATCH_TOKEN log_id=$event_id"
-      fi
-    elif [[ "$event_body" == app-server\ event:\ item/completed* ]] ||
-      [[ "$event_body" == app-server\ event:\ turn/completed* ]]; then
-      if [ -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
-        cmd_release "$CODEX_WATCH_TOKEN"
-        log "watch-codex-logs-once: turn completed, token=$CODEX_WATCH_TOKEN log_id=$event_id"
-      fi
-    fi
-  fi
-
-  printf '%s\n' "$latest_id" >"$CODEX_LOG_CURSOR_FILE"
-}
-
-cmd_watch_codex_logs() {
-  if [ ! -f "$CODEX_LOG_DB" ]; then
-    log "watch-codex-logs: log DB not found: $CODEX_LOG_DB"
-    return 1
-  fi
-
-  trap '
-    if [ -e "$HOLDERS_DIR/$CODEX_WATCH_TOKEN" ]; then
-      cmd_release "$CODEX_WATCH_TOKEN" || true
-      log "watch-codex-logs: released token=$CODEX_WATCH_TOKEN on exit"
-    fi
-    exit 0
-  ' INT TERM
-
-  while true; do
-    cmd_watch_codex_logs_once
-    sleep "$CODEX_LOG_INTERVAL"
-  done
 }
 
 # crash-leak 対策の安全網。
-# ターン中に acquire したまま claude/codex が異常終了すると、session_id のような
+# ターン中に acquire したまま claude が異常終了すると、session_id のような
 # 非数値 token は reap で消えず holder が残り caffeinate が動き続ける。
-# そこで「claude も codex も 1 つも生きていない」ときに限り、残存 holder を掃除して停止する。
-# Codex C 案を有効化した環境では、janitor 側にも `AGENT_CAFFEINE_CODEX_PATTERN` を与える。
-# どちらかが生きている間は、他人の holder を巻き込まないよう一切触らない（過剰停止の防止）。
+# そこで「claude が 1 つも生きていない」ときに限り、残存 holder を掃除して停止する。
+# claude が生きている間は、他人の holder を巻き込まないよう一切触らない（過剰停止の防止）。
 #
 # 安全弁: 全滅と判定しても、作られてから JANITOR_GRACE 秒未満の holder は消さない。
 # 検出パターンの誤判定や acquire 直後の取りこぼしで誤って「全滅」と見えても、
 # 起動直後の現役セッションを巻き込まない。古い holder が残らなければ caffeinate を止める。
-# ※ mtime 取得は macOS/BSD の `stat -f %m`（本ツールは darwin 専用: caffeinate/pmset）。
 cmd_janitor() {
   reap # まず数値 token（PID 消滅）を通常掃除
   if agents_alive; then
+    # claude 稼働中: holder>0 で daemon が死んでいたら復活させる。
+    # daemon はスリープ復帰時の強制終了などで落ちることがあり、そのままだと
+    # 承認待ちや長時間ターン中に再びスリープしてしまう。janitor が毎分回るので
+    # 最大60秒で自己修復できる。
+    if [ "$(count_holders)" -gt 0 ]; then
+      ensure_daemon
+    fi
     log "janitor: agents alive, holders=$(count_holders) (no-op)"
     return 0
   fi
@@ -323,12 +173,23 @@ cmd_release() {
 }
 
 cmd_status() {
-  if caffeinate_running; then
-    echo "sleep-inhibit: RUNNING (pid $(cat "$PID_FILE"))"
+  if daemon_running; then
+    echo "daemon: RUNNING (pid $(cat "$DAEMON_PID_FILE"))"
   else
-    echo "sleep-inhibit: stopped"
+    echo "daemon: NOT RUNNING (start via Task Scheduler 'agent-caffeine-daemon' or logoff/logon)"
   fi
-  echo "holders: $(count_holders)"
+  local holders
+  holders=$(count_holders)
+  echo "holders: $holders"
+  if [ "$holders" -gt 0 ]; then
+    if daemon_running; then
+      echo "sleep-inhibit: ACTIVE (daemon injecting F15+cursor while holders>0)"
+    else
+      echo "sleep-inhibit: INACTIVE (holders present but daemon down — will NOT prevent sleep)"
+    fi
+  else
+    echo "sleep-inhibit: idle (no holders)"
+  fi
   local f
   for f in "$HOLDERS_DIR"/*; do
     [ -e "$f" ] || continue
@@ -351,12 +212,8 @@ reap)
   echo "holders: $(count_holders)"
   ;;
 janitor) cmd_janitor ;;
-watch-codex-once) cmd_watch_codex_once ;;
-watch-codex) cmd_watch_codex ;;
-watch-codex-logs-once) cmd_watch_codex_logs_once ;;
-watch-codex-logs) cmd_watch_codex_logs ;;
 *)
-  echo "usage: agent-caffeine {acquire|release|status|reap|janitor|watch-codex-once|watch-codex|watch-codex-logs-once|watch-codex-logs} [token]" >&2
+  echo "usage: agent-caffeine {acquire|release|status|reap|janitor} [token]" >&2
   exit 1
   ;;
 esac

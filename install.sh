@@ -2,7 +2,7 @@
 # install.sh — agent-caffeine をデプロイする
 #
 # このプロジェクトを「正本」とし、実行バイナリを ~/.local/bin に symlink する。
-# フック / launchd への配線（A 案 or B 案）は破壊的なので自動編集しない。
+# フック / タスクスケジューラへの配線は破壊的なので自動編集しない。
 # どこに何を足すかのスニペットを表示するだけにして、手動適用を促す。
 
 set -euo pipefail
@@ -37,9 +37,6 @@ case "$OS" in
       /TN "agent-caffeine-janitor" /F
     echo "registered: agent-caffeine-janitor (Task Scheduler)"
     echo
-    echo "Codex log watcher は以下で手動登録（~/.codex/logs_2.sqlite が必要）:"
-    echo "  schtasks /Create /XML task-scheduler/agent-caffeine-watch-codex.xml /TN agent-caffeine-watch-codex /F"
-    echo
     ;;
 esac
 
@@ -53,12 +50,6 @@ cat <<'EOF'
     Stop             -> agent-caffeine release <session_id>
 
   ※ jq が必要です。未インストールの場合: winget install jqlang.jq
-
-[Codex 監視]
-  タスクスケジューラへ登録（~/.codex/logs_2.sqlite が必要）:
-    schtasks /Create /XML task-scheduler\agent-caffeine-watch-codex.xml /TN agent-caffeine-watch-codex /F
-
-  ※ sqlite3 が必要です。未インストールの場合: winget install SQLite.SQLite
 
 ----------------------------------------------------------------------------
 動作確認:

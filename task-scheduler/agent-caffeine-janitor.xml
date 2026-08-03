@@ -1,17 +1,30 @@
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>agent-caffeine janitor: crash-leak cleanup every 60 seconds</Description>
+    <Description>agent-caffeine janitor: every-minute leak cleanup and daemon self-heal. Runs invisibly via wscript+VBS wrapper (bash.exe launched directly by Task Scheduler flashes a console window every run; the wrapper suppresses that with SW_HIDE).</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
+      <UserId>NMCORP\N196893</UserId>
+    </LogonTrigger>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
       <Repetition>
         <Interval>PT1M</Interval>
+        <Duration>P9999D</Duration>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
-    </LogonTrigger>
+    </TimeTrigger>
   </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>NMCORP\N196893</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
@@ -23,13 +36,13 @@
       <RestartOnIdle>false</RestartOnIdle>
     </IdleSettings>
     <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Hidden>true</Hidden>
+    <ExecutionTimeLimit>PT2M</ExecutionTimeLimit>
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>C:\Program Files\Git\bin\bash.exe</Command>
-      <Arguments>-l -c "agent-caffeine janitor >> '%USERPROFILE%\agent-caffeine-janitor.log' 2>&amp;1"</Arguments>
+      <Command>wscript.exe</Command>
+      <Arguments>"C:\Users\N196893\agent-caffeine-windows\task-scheduler\run-hidden.vbs" "C:\Users\N196893\AppData\Local\Programs\Git\bin\bash.exe -c '/c/Users/N196893/agent-caffeine-windows/src/agent-caffeine janitor &gt;&gt; /c/Users/N196893/.local/state/agent-caffeine/janitor.log 2&gt;&amp;1'"</Arguments>
     </Exec>
   </Actions>
 </Task>
