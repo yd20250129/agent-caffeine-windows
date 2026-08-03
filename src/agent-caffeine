@@ -20,6 +20,7 @@
 #   agent-caffeine status            # 状態と holder 一覧、daemon プロセス生存を表示
 #   agent-caffeine reap              # 死んだ holder（数値PID消滅）を掃除
 #   agent-caffeine janitor           # claude が皆無なら残存 holder を全消去（crash-leak 対策）
+#   agent-caffeine repair            # zombie/hung daemon を強制的に End→Run で回復
 #
 # token を省略すると呼び出し元の PPID を使う。Claude フックからは session_id など
 # 「生きている間ユニーク」な値を渡すのが堅い。
@@ -37,6 +38,11 @@ STATE_DIR="${AGENT_CAFFEINE_STATE:-$HOME/.local/state/agent-caffeine}"
 HOLDERS_DIR="$STATE_DIR/holders"
 # daemon.ps1 が自身の PID を書き出すファイル。存在＆生存で daemon 稼働中とみなす。
 DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
+# daemon がループごとに更新するファイル。mtime が古い＝ハング/停止の証拠。
+DAEMON_HEARTBEAT_FILE="$STATE_DIR/daemon.heartbeat"
+# heartbeat がこの秒数以上更新されていなければハング判定。
+# daemon の interval は 20s (デフォルト) なので 3x マージンで 90s に設定。
+DAEMON_HEARTBEAT_STALE_SEC="${AGENT_CAFFEINE_HEARTBEAT_STALE:-90}"
 # PS の -match は正規表現。Windows パスは `\` セパレータなので `/` を含めないこと。
 # 旧デフォルト `win32-x64/claude` は絶対にマッチしなかった (Path=...anthropic.claude-code-*-win32-x64\resources\...).
 # `claude-code.*win32-x64` はプロセスパスに含まれる安定した部分文字列。
@@ -64,12 +70,30 @@ process_matches() {
 # daemon.ps1 (タスクスケジューラで常駐) の生存確認。
 # daemon が書いた PID は Windows のPID。Git Bash の `kill -0` は Windows PID を
 # そのまま解釈できないため、PowerShell 経由で確認する。
+# 注意: Windows は PID を再利用する。単に Get-Process が返るだけでは、旧 daemon PID
+# が別プロセス（別の powershell や無関係な EXE）として再利用されている場合を
+# 見逃す。プロセス名とコマンドラインで daemon.ps1 かを検証する。
 daemon_running() {
   [ -f "$DAEMON_PID_FILE" ] || return 1
   local pid
   pid=$(cat "$DAEMON_PID_FILE" 2>/dev/null || true)
   [ -n "$pid" ] || return 1
-  powershell.exe -NoProfile -WindowStyle Hidden -Command "if (Get-Process -Id $pid -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" 2>/dev/null
+  case "$pid" in
+  *[!0-9]*) return 1 ;;
+  esac
+  powershell.exe -NoProfile -WindowStyle Hidden -Command "\$p = Get-CimInstance Win32_Process -Filter 'ProcessId=$pid' -ErrorAction SilentlyContinue; if (\$p -and \$p.Name -match '^(powershell|pwsh)\.exe\$' -and \$p.CommandLine -match 'daemon\.ps1') { exit 0 } else { exit 1 }" 2>/dev/null
+}
+
+# heartbeat の mtime を見て「動いてるが effectively 死んでる」daemon を検出。
+# プロセスは生きていても SendKeys が silent-fail するとか、無限 Start-Sleep で
+# ハングしているケースをここで拾う。
+daemon_heartbeat_stale() {
+  [ -f "$DAEMON_HEARTBEAT_FILE" ] || return 0 # ファイル無しは stale 扱い
+  local mtime now age
+  mtime=$(stat --format=%Y "$DAEMON_HEARTBEAT_FILE" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  age=$((now - mtime))
+  [ "$age" -ge "$DAEMON_HEARTBEAT_STALE_SEC" ]
 }
 
 # daemon 分離設計のため、agent-caffeine 側では起動/停止を行わない。
@@ -81,13 +105,34 @@ stop_caffeinate() { :; }
 # daemon が死んでいたらタスクスケジューラ経由で起こす。冪等 (既に生きていれば
 # daemon.ps1 側で「already running, exiting」と判断して黙って抜ける)。
 # 死因例: スリープ復帰時の強制終了、想定外の例外、手動 taskkill 等。
-# janitor から holder>0 の状態で呼ばれることを想定している。
+#
+# 罠 (2026-08-03 実測):
+#   タスクの MultipleInstancesPolicy=IgnoreNew では、daemon.ps1 プロセスが
+#   死んでも Task Scheduler の State が Running のまま残ることがあり
+#   (LastTaskResult=267009 "task is currently running")、`schtasks /Run` して
+#   もキューイングされず新プロセスが上がらない。そのため /End で State を
+#   Ready に落としてから /Run する。/End 自体は既に死んでる状態でも副作用なし。
 ensure_daemon() {
-  if daemon_running; then return 0; fi
-  # 古い pid ファイルが残っているとdaemon.ps1が起動を拒否するので消しておく
-  rm -f "$DAEMON_PID_FILE"
+  local reason="${1:-dead}"
+  if daemon_running && ! daemon_heartbeat_stale; then return 0; fi
+  # 古い pid/heartbeat が残っていると誤判定の元になるので消しておく
+  rm -f "$DAEMON_PID_FILE" "$DAEMON_HEARTBEAT_FILE"
+  # State=Running の zombie を落として次の /Run を確実に受け付けさせる
+  schtasks.exe //End //TN "agent-caffeine-daemon" >/dev/null 2>&1 || true
   schtasks.exe //Run //TN "agent-caffeine-daemon" >/dev/null 2>&1 || true
-  log "ensure_daemon: dead daemon detected, requested restart via Task Scheduler"
+  # /Run はキュー投入だけで返るので、実際に daemon が上がって pid file を
+  # 書くまで最大 10 秒 poll する。呼び出し元 (acquire) が「上がってる想定」で
+  # 制御を返せるようにするため。
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if daemon_running; then break; fi
+    sleep 1
+  done
+  if daemon_running; then
+    log "ensure_daemon: restarted ($reason) pid=$(cat "$DAEMON_PID_FILE" 2>/dev/null)"
+  else
+    log "ensure_daemon: restart requested ($reason) but daemon not yet visible after 10s"
+  fi
 }
 
 reap() {
@@ -126,14 +171,21 @@ agents_alive() {
 cmd_janitor() {
   reap # まず数値 token（PID 消滅）を通常掃除
   if agents_alive; then
-    # claude 稼働中: holder>0 で daemon が死んでいたら復活させる。
-    # daemon はスリープ復帰時の強制終了などで落ちることがあり、そのままだと
-    # 承認待ちや長時間ターン中に再びスリープしてしまう。janitor が毎分回るので
-    # 最大60秒で自己修復できる。
-    if [ "$(count_holders)" -gt 0 ]; then
-      ensure_daemon
+    # claude 稼働中: daemon の生死は holders の有無に関わらず担保する。
+    # 旧実装は holders>0 のときしか ensure_daemon を呼ばなかったが、これだと
+    #   1) 現在 holders=0 で daemon が死んでいる
+    #   2) 直後に acquire で holder が作られる
+    #   3) 次の janitor サイクル (最大60秒) までスリープ抑止が動かない
+    # という穴が生じる。acquire 側でも ensure_daemon するようにしたが、janitor
+    # でも常時走らせて二重に守る。ensure_daemon は生きていれば即 return なので
+    # 副作用はない。heartbeat が古い（プロセスは生きてるがループが止まっている）
+    # ケースもここで検知して再起動する。
+    if daemon_heartbeat_stale && daemon_running; then
+      ensure_daemon "heartbeat stale"
+    else
+      ensure_daemon "periodic check"
     fi
-    log "janitor: agents alive, holders=$(count_holders) (no-op)"
+    log "janitor: agents alive, holders=$(count_holders) daemon=$(daemon_running && echo up || echo down)"
     return 0
   fi
   local purged=0 kept=0 now age f
@@ -159,7 +211,11 @@ cmd_janitor() {
 cmd_acquire() {
   local token="${1:-$PPID}"
   : >"$HOLDERS_DIR/$token"
-  start_caffeinate
+  # acquire のたびに daemon 生存を担保する。ここで daemon が死んでいた場合、
+  # 従来は janitor の次回サイクル（最大60秒）まで抑止が効かず、その間に
+  # スリープしてしまう。ensure_daemon は生きていれば即 return するので
+  # 呼び出しコストは小さい（PowerShell 起動 1 回）。
+  ensure_daemon "acquire" || true
   log "acquire token=$token holders=$(count_holders)"
 }
 
@@ -173,19 +229,28 @@ cmd_release() {
 }
 
 cmd_status() {
+  local heartbeat_age="n/a"
+  if [ -f "$DAEMON_HEARTBEAT_FILE" ]; then
+    heartbeat_age=$(( $(date +%s) - $(stat --format=%Y "$DAEMON_HEARTBEAT_FILE" 2>/dev/null || echo 0) ))
+    heartbeat_age="${heartbeat_age}s ago"
+  fi
   if daemon_running; then
-    echo "daemon: RUNNING (pid $(cat "$DAEMON_PID_FILE"))"
+    if daemon_heartbeat_stale; then
+      echo "daemon: HUNG (pid $(cat "$DAEMON_PID_FILE"), heartbeat $heartbeat_age; process alive but loop stalled)"
+    else
+      echo "daemon: RUNNING (pid $(cat "$DAEMON_PID_FILE"), heartbeat $heartbeat_age)"
+    fi
   else
-    echo "daemon: NOT RUNNING (start via Task Scheduler 'agent-caffeine-daemon' or logoff/logon)"
+    echo "daemon: NOT RUNNING (start via Task Scheduler 'agent-caffeine-daemon' or 'agent-caffeine repair')"
   fi
   local holders
   holders=$(count_holders)
   echo "holders: $holders"
   if [ "$holders" -gt 0 ]; then
-    if daemon_running; then
+    if daemon_running && ! daemon_heartbeat_stale; then
       echo "sleep-inhibit: ACTIVE (daemon injecting F15+cursor while holders>0)"
     else
-      echo "sleep-inhibit: INACTIVE (holders present but daemon down — will NOT prevent sleep)"
+      echo "sleep-inhibit: INACTIVE (holders present but daemon down or hung -- run 'agent-caffeine repair')"
     fi
   else
     echo "sleep-inhibit: idle (no holders)"
@@ -195,6 +260,23 @@ cmd_status() {
     [ -e "$f" ] || continue
     echo "  - $(basename "$f")"
   done
+}
+
+cmd_repair() {
+  # 手動リカバリ用: zombie / hung を強制的に End→Run で回復させる。
+  # daemon_running=true でも heartbeat stale なら「動いてるが効いてない」なので
+  # ensure_daemon 側で End してから Run する。
+  log "repair: forcing daemon restart"
+  rm -f "$DAEMON_PID_FILE" "$DAEMON_HEARTBEAT_FILE"
+  schtasks.exe //End //TN "agent-caffeine-daemon" >/dev/null 2>&1 || true
+  sleep 1
+  schtasks.exe //Run //TN "agent-caffeine-daemon" >/dev/null 2>&1 || true
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if daemon_running; then break; fi
+    sleep 1
+  done
+  cmd_status
 }
 
 case "${1:-}" in
@@ -212,8 +294,9 @@ reap)
   echo "holders: $(count_holders)"
   ;;
 janitor) cmd_janitor ;;
+repair) cmd_repair ;;
 *)
-  echo "usage: agent-caffeine {acquire|release|status|reap|janitor} [token]" >&2
+  echo "usage: agent-caffeine {acquire|release|status|reap|janitor|repair} [token]" >&2
   exit 1
   ;;
 esac

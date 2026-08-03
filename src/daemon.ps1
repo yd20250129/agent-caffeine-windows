@@ -30,18 +30,26 @@ $ErrorActionPreference = 'Continue'
 
 $stateDir = if ($env:AGENT_CAFFEINE_STATE) { $env:AGENT_CAFFEINE_STATE } else { Join-Path $env:USERPROFILE '.local\state\agent-caffeine' }
 $holdersDir = Join-Path $stateDir 'holders'
-$intervalSec = if ($env:AGENT_CAFFEINE_INTERVAL_SEC) { [int]$env:AGENT_CAFFEINE_INTERVAL_SEC } else { 60 }
+$intervalSec = if ($env:AGENT_CAFFEINE_INTERVAL_SEC) { [int]$env:AGENT_CAFFEINE_INTERVAL_SEC } else { 20 }
 $logFile = if ($env:AGENT_CAFFEINE_LOG) { $env:AGENT_CAFFEINE_LOG } else { Join-Path $stateDir 'daemon.log' }
 $pidFile = Join-Path $stateDir 'daemon.pid'
+$heartbeatFile = Join-Path $stateDir 'daemon.heartbeat'
 
 New-Item -ItemType Directory -Force -Path $holdersDir | Out-Null
 
-# Guard against multiple daemons: silently exit if another one is alive.
+# Guard against multiple daemons.
+# NOTE: Just checking (Get-Process -Id $oldPid) is unsafe -- Windows recycles PIDs,
+# and if the old PID has been reassigned to some unrelated powershell.exe (or any
+# process), we would falsely exit while no daemon is actually running.
+# Verify the old process is really a powershell running our script.
 if (Test-Path $pidFile) {
-    $oldPid = Get-Content $pidFile -ErrorAction SilentlyContinue
-    if ($oldPid -and (Get-Process -Id $oldPid -ErrorAction SilentlyContinue)) {
-        "[$(Get-Date -Format s)] daemon already running (pid=$oldPid), exiting" | Out-File -Append $logFile
-        exit 0
+    $oldPid = (Get-Content $pidFile -ErrorAction SilentlyContinue | Out-String).Trim()
+    if ($oldPid -match '^\d+$') {
+        $oldProc = Get-CimInstance Win32_Process -Filter "ProcessId=$oldPid" -ErrorAction SilentlyContinue
+        if ($oldProc -and $oldProc.Name -match '^(powershell|pwsh)\.exe$' -and $oldProc.CommandLine -match 'daemon\.ps1') {
+            "[$(Get-Date -Format s)] daemon already running (pid=$oldPid), exiting" | Out-File -Append $logFile
+            exit 0
+        }
     }
 }
 "$PID" | Out-File -FilePath $pidFile -Encoding ascii -NoNewline
@@ -94,9 +102,14 @@ try {
             Write-Log "holders=$holders"
             $lastHolderCount = $holders
         }
+        # Heartbeat: janitor checks the mtime of this file to detect a hung daemon
+        # (process alive but SendKeys silent-failing / loop stalled). Written every
+        # iteration so an mtime older than a few intervals is a strong hang signal.
+        try { [System.IO.File]::WriteAllText($heartbeatFile, "$PID`n$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())") } catch {}
         Start-Sleep -Seconds $intervalSec
     }
 } finally {
     Remove-Item -Force $pidFile -ErrorAction SilentlyContinue
+    Remove-Item -Force $heartbeatFile -ErrorAction SilentlyContinue
     Write-Log "daemon exiting pid=$PID"
 }

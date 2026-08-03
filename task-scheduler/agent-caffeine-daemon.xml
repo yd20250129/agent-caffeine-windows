@@ -17,7 +17,15 @@
     </Principal>
   </Principals>
   <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <!--
+      Queue: 前のインスタンスが動いていても /Run を捨てずに次を待たせる。
+      IgnoreNew だと State=Running 残留の zombie 時に /Run が黙って捨てられて
+      復旧できない罠があった (2026-08-03 実測)。ensure_daemon 側で End→Run
+      するので Queue でも重複起動はほぼ無く、万一並列起動しても daemon.ps1 の
+      pid guard で二重目は即 exit する。Parallel も可だが RestartOnFailure と
+      競合して複数プロセスが一瞬立ち上がる race があり、ログが混乱するので Queue にする。
+    -->
+    <MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>true</AllowHardTerminate>
