@@ -25,6 +25,21 @@
 #   AGENT_CAFFEINE_STATE        state dir (default: $env:USERPROFILE\.local\state\agent-caffeine)
 #   AGENT_CAFFEINE_INTERVAL_SEC injection interval seconds (default: 60)
 #   AGENT_CAFFEINE_LOG          log file (default: $stateDir\daemon.log)
+#   AGENT_CAFFEINE_WATCH_VSCODE opt-in: '1'/'true' auto-holds a 'vscode-alive'
+#                               holder while any VSCode process is running.
+#                               Default OFF.
+#                               Purpose: when running Claude Code on EC2 via
+#                               VSCode Remote SSH, the Windows-side hook does
+#                               not fire and the machine sleeps after DC 180s.
+#                               Treat VSCode being open as "user is working on
+#                               this PC" and inhibit sleep. Detecting Remote
+#                               SSH via TCP or host allowlists was judged
+#                               overkill; VSCode process liveness is a cheap
+#                               proxy that also covers the "stepped away
+#                               during a permission prompt" case.
+#                               Side effect: leaving VSCode open with no work
+#                               keeps inhibit alive (harm is battery drain
+#                               only, accepted).
 
 $ErrorActionPreference = 'Continue'
 
@@ -34,6 +49,11 @@ $intervalSec = if ($env:AGENT_CAFFEINE_INTERVAL_SEC) { [int]$env:AGENT_CAFFEINE_
 $logFile = if ($env:AGENT_CAFFEINE_LOG) { $env:AGENT_CAFFEINE_LOG } else { Join-Path $stateDir 'daemon.log' }
 $pidFile = Join-Path $stateDir 'daemon.pid'
 $heartbeatFile = Join-Path $stateDir 'daemon.heartbeat'
+
+# Auto-hold holder name defined in one place. Future auto-hold sources such
+# as 'remote-ssh-alive' should be listed alongside here so that magic strings
+# do not scatter across the file.
+$VSCodeHolderName = 'vscode-alive'
 
 New-Item -ItemType Directory -Force -Path $holdersDir | Out-Null
 
@@ -68,6 +88,54 @@ function Get-HolderCount {
     (Get-ChildItem -File -Path $holdersDir -ErrorAction SilentlyContinue | Measure-Object).Count
 }
 
+# Loose match for the opt-in flag. '1' or 'true' (case variants) count as
+# enabled; unset / '0' / empty count as disabled. Kept as one function so the
+# flag name or accepted true-values can be changed in a single place.
+function Test-WatchVSCodeEnabled {
+    $v = $env:AGENT_CAFFEINE_WATCH_VSCODE
+    if (-not $v) { return $false }
+    return ($v -in @('1', 'true', 'TRUE', 'True'))
+}
+
+# VSCode process liveness. No distinction between stable / Insiders / Cursor
+# for the initial version -- if any parent Code.exe is alive we return true.
+# Get-Process throws when the target name has no matches, so
+# -ErrorAction SilentlyContinue is required.
+function Test-VSCodeAlive {
+    $procs = Get-Process -Name Code -ErrorAction SilentlyContinue
+    return [bool]$procs
+}
+
+# Reflect VSCode liveness into holders/. Idempotent: when enabled and alive,
+# touch the fixed-name holder every iteration; when enabled and gone, delete
+# it. When disabled, remove the fixed-name holder if it happens to exist
+# (leaked from a previous enabled run); other holders are never touched,
+# so flipping opt-in off never disturbs unrelated CLI-acquired holders.
+function Update-VSCodeHolder {
+    $holderPath = Join-Path $holdersDir $VSCodeHolderName
+    if (-not (Test-WatchVSCodeEnabled)) {
+        # Clean up only the fixed-name holder; leave every other file alone.
+        if (Test-Path $holderPath) {
+            try { Remove-Item -Force $holderPath -ErrorAction SilentlyContinue } catch { Write-Log "vscode-alive cleanup (disabled) failed: $_" }
+            return 'disabled-cleaned'
+        }
+        return $null
+    }
+    $alive = Test-VSCodeAlive
+    if ($alive) {
+        # touch: WriteAllText with empty string just refreshes mtime and
+        # creates the file if missing. New-Item -Force works too but emits a
+        # warning on some hosts when overwriting an existing item.
+        try { [System.IO.File]::WriteAllText($holderPath, '') } catch { Write-Log "vscode-alive touch failed: $_" }
+        return 'alive'
+    } else {
+        if (Test-Path $holderPath) {
+            try { Remove-Item -Force $holderPath -ErrorAction SilentlyContinue } catch { Write-Log "vscode-alive remove failed: $_" }
+        }
+        return 'gone'
+    }
+}
+
 Write-Log "daemon started pid=$PID interval=${intervalSec}s stateDir=$stateDir"
 
 # ES_CONTINUOUS is retained by the process, so set it once up front.
@@ -78,9 +146,30 @@ Write-Log "daemon started pid=$PID interval=${intervalSec}s stateDir=$stateDir"
 # because the negative Int32 can't convert to UInt32. Use decimal literals.
 [Win32.Power]::SetThreadExecutionState(2147483651) | Out-Null
 
+# Fire once before the loop so that if the daemon is restarted while the DC
+# 180s timer is already ticking, we do not wait a full interval before the
+# first holder appears. When the flag is off Update-VSCodeHolder returns
+# $null and this is a no-op.
+$vscodeState = Update-VSCodeHolder
+if ($null -ne $vscodeState) {
+    Write-Log "vscode-watch initial state=$vscodeState"
+}
+$lastVSCodeState = $vscodeState
+
 $lastHolderCount = -1
 try {
     while ($true) {
+        # Update VSCode state BEFORE Get-HolderCount so a fresh transition
+        # takes effect in the same iteration (VSCode just opened -> holder=1
+        # -> inhibit re-asserts on this same tick, not the next).
+        # Update-VSCodeHolder returns: 'alive' (enabled+running),
+        # 'gone' (enabled+no VSCode), 'disabled-cleaned' (disabled but had to
+        # remove leaked holder), or $null (disabled, nothing to do).
+        $vscodeState = Update-VSCodeHolder
+        if ($vscodeState -ne $lastVSCodeState) {
+            if ($null -ne $vscodeState) { Write-Log "vscode-watch state=$vscodeState" }
+            $lastVSCodeState = $vscodeState
+        }
         $holders = Get-HolderCount
         if ($holders -gt 0) {
             # Re-assert ES_CONTINUOUS defensively.
